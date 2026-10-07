@@ -1,14 +1,16 @@
 from __future__ import annotations
 
+import csv
 import json
+import shutil
 import sqlite3
 import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import Qt, QRectF, QPointF, Signal
-from PySide6.QtGui import QColor, QBrush, QPen, QPainter, QFont, QAction
+from PySide6.QtCore import Qt, QRectF, QPointF, Signal, QUrl
+from PySide6.QtGui import QColor, QBrush, QPen, QPainter, QFont, QAction, QDesktopServices
 from PySide6.QtWidgets import (
     QApplication, QAbstractItemView, QDialog, QDialogButtonBox, QFileDialog,
     QFormLayout, QFrame, QGraphicsEllipseItem, QGraphicsLineItem,
@@ -47,7 +49,7 @@ class Database:
           description TEXT, status TEXT DEFAULT 'Active', updated_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS plans(
           id INTEGER PRIMARY KEY AUTOINCREMENT, project_id INTEGER NOT NULL, title TEXT NOT NULL,
-          file_name TEXT, description TEXT, updated_at TEXT NOT NULL,
+          file_name TEXT, file_path TEXT, description TEXT, updated_at TEXT NOT NULL,
           FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE);
         CREATE TABLE IF NOT EXISTS tasks(
           id INTEGER PRIMARY KEY AUTOINCREMENT, project_id INTEGER NOT NULL, plan_id INTEGER,
@@ -86,8 +88,8 @@ class Database:
         cur = self.conn.execute("INSERT INTO projects(name,code,description,updated_at) VALUES(?,?,?,?)", (name, code, description, now()))
         self.conn.commit(); return cur.lastrowid
 
-    def add_plan(self, project_id, title, file_name="", description=""):
-        cur = self.conn.execute("INSERT INTO plans(project_id,title,file_name,description,updated_at) VALUES(?,?,?,?,?)", (project_id, title, file_name, description, now()))
+    def add_plan(self, project_id, title, file_name="", description="", file_path=""):
+        cur = self.conn.execute("INSERT INTO plans(project_id,title,file_name,file_path,description,updated_at) VALUES(?,?,?,?,?,?)", (project_id, title, file_name, file_path, description, now()))
         self.conn.commit(); return cur.lastrowid
 
     def add_task(self, project_id, plan_id, title, description, assignee, trade, location, priority, status, due_date, tags):
@@ -104,7 +106,20 @@ class Database:
         if search: q += " AND (t.title LIKE ? OR t.assignee LIKE ? OR t.trade LIKE ?)"; args += [f"%{search}%"]*3
         return self.conn.execute(q + " ORDER BY CASE t.priority WHEN 'P1' THEN 1 WHEN 'P2' THEN 2 ELSE 3 END, t.due_date", args).fetchall()
     def update_task_status(self, tid, status):
-        self.conn.execute("UPDATE tasks SET status=?, updated_at=? WHERE id=?", (status, now(), tid)); self.conn.commit()
+        task = self.conn.execute("SELECT title FROM tasks WHERE id=?", (tid,)).fetchone()
+        self.conn.execute("UPDATE tasks SET status=?, updated_at=? WHERE id=?", (status, now(), tid))
+        if status == "done" and task:
+            self.conn.execute("INSERT INTO notifications(title,body,created_at) VALUES(?,?,?)", ("Task completed", f"{task['title']} was marked complete.", now()))
+        self.conn.commit()
+
+    def delete_task(self, tid):
+        self.conn.execute("DELETE FROM tasks WHERE id=?", (tid,)); self.conn.commit()
+
+    def delete_project(self, pid):
+        self.conn.execute("DELETE FROM projects WHERE id=?", (pid,)); self.conn.commit()
+
+    def add_notification(self, title, body):
+        self.conn.execute("INSERT INTO notifications(title,body,created_at) VALUES(?,?,?)", (title, body, now())); self.conn.commit()
     def markups(self, plan_id): return self.conn.execute("SELECT * FROM markups WHERE plan_id=? ORDER BY id", (plan_id,)).fetchall()
     def add_markup(self, plan_id, kind, x, y, w, h, label=""):
         self.conn.execute("INSERT INTO markups(plan_id,kind,x,y,w,h,label,created_at) VALUES(?,?,?,?,?,?,?,?)", (plan_id,kind,x,y,w,h,label,now())); self.conn.commit()
@@ -222,7 +237,26 @@ class MainWindow(QMainWindow):
                 for c,v in enumerate(vals): table.setItem(r,c,QTableWidgetItem(str(v or "")))
                 table.item(r,1).setForeground(QColor("#d94b4b" if t["priority"]=="P1" else "#bf7a21" if t["priority"]=="P2" else "#47815e")); table.item(r,0).setData(Qt.UserRole,t["id"])
             table.cellDoubleClicked.connect(lambda r,c:self.task_status_dialog(table.item(r,0).data(Qt.UserRole)))
+        actions=QHBoxLayout(); delete=QPushButton("Delete selected task"); delete.clicked.connect(lambda:self.delete_selected_task(table)); actions.addWidget(delete); actions.addStretch(); lay.addLayout(actions)
         search.textChanged.connect(refresh); refresh()
+    def export_tasks(self):
+        path, _ = QFileDialog.getSaveFileName(self, "Export tasks", "thekkedar_tasks.csv", "CSV files (*.csv)")
+        if not path: return
+        rows = self.db.tasks(self.current_project)
+        with open(path, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.writer(f); writer.writerow(["Title","Priority","Status","Assignee","Trade","Location","Due date","Plan","Tags"])
+            for t in rows: writer.writerow([t["title"],t["priority"],t["status"],t["assignee"],t["trade"],t["location"],t["due_date"],t["plan_title"] or "",t["tags"]])
+        self.db.add_notification("Tasks exported", f"Exported {len(rows)} task(s) to {Path(path).name}.")
+        QMessageBox.information(self, "Export complete", f"Saved {len(rows)} tasks to:
+{path}")
+
+    def delete_selected_task(self, table):
+        row = table.currentRow()
+        if row < 0: QMessageBox.information(self, "Select a task", "Select a task row first."); return
+        tid = table.item(row, 0).data(Qt.UserRole); title = table.item(row, 0).text()
+        if QMessageBox.question(self, "Delete task", f"Delete '{title}'? This cannot be undone.") == QMessageBox.Yes:
+            self.db.delete_task(tid); self.show_tasks(self.current_project)
+
     def add_task_dialog(self,pid):
         if not pid: QMessageBox.information(self,"Create a project first","Add a project before creating tasks."); return
         if TaskDialog(self.db,pid,self).exec(): self.show_tasks(pid)
@@ -230,7 +264,7 @@ class MainWindow(QMainWindow):
         t=self.db.conn.execute("SELECT * FROM tasks WHERE id=?",(tid,)).fetchone(); d=QDialog(self); d.setWindowTitle("Update task"); f=QFormLayout(d); status=QComboBox(); status.addItems(["open","in_progress","blocked","done"]); status.setCurrentText(t["status"]); f.addRow("Status",status); note=QLabel(t["title"]); note.setWordWrap(True); f.addRow("Task",note); bb=QDialogButtonBox(QDialogButtonBox.Save|QDialogButtonBox.Cancel); bb.accepted.connect(d.accept); bb.rejected.connect(d.reject); f.addRow(bb)
         if d.exec(): self.db.update_task_status(tid,status.currentText()); self.show_tasks(self.current_project)
     def show_plans(self):
-        self.clear_page(self.plans_page,"Plans & Markups"); lay=self.plans_page.layout(); row=QHBoxLayout(); row.addWidget(QLabel("Open a drawing to review and place normalized markups.")); row.addStretch(); lay.addLayout(row)
+        self.clear_page(self.plans_page,"Plans & Markups"); lay=self.plans_page.layout(); row=QHBoxLayout(); row.addWidget(QLabel("Import drawings, open source files, and place normalized markups.")); row.addStretch(); add=QPushButton("+  Import plan"); add.clicked.connect(self.import_plan_dialog); row.addWidget(add); lay.addLayout(row)
         split=QSplitter(Qt.Horizontal); listw=QListWidget(); plans=[]
         for p in self.db.projects():
             for plan in self.db.plans(p["id"]): plans.append((p,plan)); it=QListWidgetItem(f"{plan['title']}\n{p['code']}  ·  {plan['file_name'] or 'local drawing'}"); it.setData(Qt.UserRole,plan["id"]); listw.addItem(it)
@@ -240,10 +274,24 @@ class MainWindow(QMainWindow):
             if old:
                 while old.count(): old.takeAt(0).widget().deleteLater()
             lo=QVBoxLayout(self.canvas_host); tools=QHBoxLayout()
+            if plan["file_path"] and Path(plan["file_path"]).exists():
+                open_src=QPushButton("Open source file"); open_src.clicked.connect(lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(plan["file_path"]))); tools.addWidget(open_src)
             for name in ["pin","rectangle","circle"]:
                 b=QPushButton(name.title()); b.clicked.connect(lambda checked=False,n=name: setattr(canvas,"active_tool",n)); tools.addWidget(b)
             tools.addStretch(); lo.addLayout(tools); canvas=PlanCanvas(self.db,self.current_plan); lo.addWidget(canvas)
         listw.itemClicked.connect(open_plan)
+    def import_plan_dialog(self):
+        projects = self.db.projects()
+        if not projects: QMessageBox.information(self, "Create a project first", "Create a project before importing a plan."); return
+        source, _ = QFileDialog.getOpenFileName(self, "Select plan file", "", "Plans (*.pdf *.png *.jpg *.jpeg *.webp);;All files (*.*)")
+        if not source: return
+        d=QDialog(self); d.setWindowTitle("Import plan"); f=QFormLayout(d); project=QComboBox();
+        for p in projects: project.addItem(f"{p['name']} ({p['code']})", p['id'])
+        title=QLineEdit(Path(source).stem); desc=QTextEdit(); desc.setFixedHeight(70); f.addRow("Project",project); f.addRow("Title",title); f.addRow("Description",desc); bb=QDialogButtonBox(QDialogButtonBox.Save|QDialogButtonBox.Cancel); bb.accepted.connect(d.accept); bb.rejected.connect(d.reject); f.addRow(bb)
+        if d.exec() and title.text().strip():
+            target_dir=APP_DIR / "plans"; target_dir.mkdir(parents=True, exist_ok=True); target=target_dir / f"{datetime.now().strftime('%Y%m%d%H%M%S')}_{Path(source).name}"; shutil.copy2(source,target)
+            self.db.add_plan(project.currentData(), title.text().strip(), Path(source).name, desc.toPlainText().strip(), str(target)); self.db.add_notification("Plan imported", f"{title.text().strip()} was added to the workspace."); self.show_plans()
+
     def show_notifications(self):
         self.clear_page(self.notif_page,"Notifications"); lay=self.notif_page.layout(); lay.addWidget(QLabel("Assignments, comments and delivery updates from your workspace.")); lst=QListWidget();
         for n in self.db.notifications(): lst.addItem(f"{n['title']}\n{n['body'] or ''}  ·  {n['created_at']}")
