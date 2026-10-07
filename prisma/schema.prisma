@@ -1,0 +1,312 @@
+// PlanForge — Prisma schema (SQLite)
+// Offline-first construction plans + tasks PWA.
+// Notes:
+// - All timestamps stored as SQLite TEXT in UTC ISO-8601 (DateTime).
+// - Soft delete: `deletedAt` on mutable entities; queries must filter `deletedAt IS NULL`.
+// - IDs are cuid() by default and are client-generatable on creates for idempotent retries.
+// - JSON fields are stored as TEXT; the app encodes/decodes JSON.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ───────────────────────── Auth & Users ─────────────────────────
+
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  passwordHash String
+  fullName     String
+  role         String   @default("engineer") // global role: admin | project_manager | engineer | foreman | viewer
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  ownedProjects     Project[]
+  memberships       ProjectMember[]
+  uploadedPlanFiles Plan[]          @relation("PlanUploader")
+  markups           Markup[]
+  markupAttachments MarkupAttachment[]
+  createdTasks      Task[]
+  assignedTasks     Task[]             @relation("TaskAssignee")
+  taskWatchers      TaskWatcher[]
+  taskComments      TaskComment[]
+  taskAttachments   TaskAttachment[]
+  refreshTokens     RefreshToken[]
+  notifications     Notification[]
+
+  @@map("users")
+}
+
+// Refresh tokens (rotating). One user may have many active sessions.
+model RefreshToken {
+  id        String   @id @default(cuid())
+  userId    String
+  tokenHash String   @unique
+  createdAt DateTime @default(now())
+  expiresAt DateTime
+  revokedAt DateTime?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("refresh_tokens")
+}
+
+// ───────────────────────── Projects ─────────────────────────
+
+model Project {
+  id          String   @id @default(cuid())
+  name        String
+  code        String   @unique
+  description String?
+  ownerId     String
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  owner    User           @relation(fields: [ownerId], references: [id])
+  members  ProjectMember[]
+  plans    Plan[]
+  tasks    Task[]
+
+  @@map("projects")
+}
+
+model ProjectMember {
+  id        String   @id @default(cuid())
+  projectId String
+  userId    String
+  role      String // admin | project_manager | engineer | foreman | viewer
+  createdAt DateTime @default(now())
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([projectId, userId])
+  @@index([userId])
+  @@map("project_members")
+}
+
+// ───────────────────────── Plans + Markups ─────────────────────────
+
+model Plan {
+  id           String   @id @default(cuid())
+  projectId    String
+  title        String
+  description  String?
+  fileName     String
+  filePath     String   // relative path under uploads/
+  fileSize     Int
+  mimeType     String
+  uploadedById String
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  uploader  User    @relation("PlanUploader", fields: [uploadedById], references: [id])
+  markups   Markup[]
+  tasks     Task[]
+
+  @@index([projectId])
+  @@map("plans")
+}
+
+model Markup {
+  id          String   @id @default(cuid())
+  planId      String
+  type        String // pin | rectangle | circle | cloud | polyline | arrow | text
+  pageNumber  Int      @default(1)
+  coordinates String   // JSON: e.g. {x,y,w,h} or points[]
+  color       String   @default("#ef4444")
+  metadata    String   @default("{}") // JSON
+  createdById String
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  plan        Plan             @relation(fields: [planId], references: [id], onDelete: Cascade)
+  createdBy   User             @relation(fields: [createdById], references: [id])
+  attachments MarkupAttachment[]
+  tasks       Task[]
+
+  @@index([planId])
+  @@map("markups")
+}
+
+model MarkupAttachment {
+  id           String   @id @default(cuid())
+  markupId     String
+  filePath     String
+  fileName     String
+  mimeType     String
+  fileSize     Int
+  uploadedById String
+  createdAt    DateTime @default(now())
+
+  markup     Markup @relation(fields: [markupId], references: [id], onDelete: Cascade)
+  uploadedBy User   @relation(fields: [uploadedById], references: [id])
+
+  @@index([markupId])
+  @@map("markup_attachments")
+}
+
+// ───────────────────────── Tasks ─────────────────────────
+
+model Task {
+  id             String    @id @default(cuid())
+  projectId      String
+  planId         String?
+  markupId       String?
+  pageNumber     Int?
+  pinCoordinates String?   // JSON {x,y} normalized 0..1 on the page
+  title          String
+  description    String?
+  assigneeId     String?
+  trade          String?
+  category       String?
+  locationName   String?
+  priority       String    @default("P2") // P1 | P2 | P3
+  status         String    @default("open") // open | in_progress | blocked | done
+  dueDate        DateTime?
+  startDate      DateTime?
+  tags           String    @default("[]") // JSON array of strings
+  estimatedHours Float?
+  actualHours    Float?
+  estimatedCost  Float?
+  actualCost     Float?
+  createdById    String
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+  deletedAt      DateTime?
+
+  project     Project          @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  plan        Plan?            @relation(fields: [planId], references: [id])
+  markup      Markup?           @relation(fields: [markupId], references: [id])
+  assignee    User?            @relation("TaskAssignee", fields: [assigneeId], references: [id])
+  createdBy   User             @relation(fields: [createdById], references: [id])
+  comments    TaskComment[]
+  attachments TaskAttachment[]
+  checklists  TaskChecklist[]
+  watchers    TaskWatcher[]
+  relationsA  TaskRelation[]    @relation("TaskRelationA")
+  relationsB  TaskRelation[]    @relation("TaskRelationB")
+  notifTasks  Notification[]    @relation("notifTasks")
+
+  @@index([projectId])
+  @@index([planId])
+  @@index([assigneeId])
+  @@map("tasks")
+}
+
+model TaskComment {
+  id        String   @id @default(cuid())
+  taskId    String
+  authorId  String
+  body      String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  deletedAt DateTime?
+
+  task   Task @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  author User @relation(fields: [authorId], references: [id])
+
+  @@index([taskId])
+  @@map("task_comments")
+}
+
+model TaskAttachment {
+  id           String   @id @default(cuid())
+  taskId       String
+  filePath     String
+  fileName     String
+  mimeType     String
+  fileSize     Int
+  uploadedById String
+  createdAt    DateTime @default(now())
+
+  task       Task @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  uploadedBy User @relation(fields: [uploadedById], references: [id])
+
+  @@index([taskId])
+  @@map("task_attachments")
+}
+
+model TaskChecklist {
+  id        String   @id @default(cuid())
+  taskId    String
+  title     String
+  order     Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  task  Task               @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  items TaskChecklistItem[]
+
+  @@index([taskId])
+  @@map("task_checklists")
+}
+
+model TaskChecklistItem {
+  id           String   @id @default(cuid())
+  checklistId  String
+  text         String
+  isChecked    Boolean  @default(false)
+  order        Int      @default(0)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  checklist TaskChecklist @relation(fields: [checklistId], references: [id], onDelete: Cascade)
+
+  @@index([checklistId])
+  @@map("task_checklist_items")
+}
+
+model TaskWatcher {
+  id     String @id @default(cuid())
+  taskId String
+  userId String
+
+  task Task @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([taskId, userId])
+  @@index([userId])
+  @@map("task_watchers")
+}
+
+model TaskRelation {
+  id           String @id @default(cuid())
+  taskId       String
+  relatedTaskId String
+  relationType String // blocks | blocked_by | related | duplicate
+
+  taskA Task @relation("TaskRelationA", fields: [taskId], references: [id], onDelete: Cascade)
+  taskB Task @relation("TaskRelationB", fields: [relatedTaskId], references: [id], onDelete: Cascade)
+
+  @@unique([taskId, relatedTaskId])
+  @@map("task_relations")
+}
+
+// ───────────────────────── Notifications ─────────────────────────
+
+model Notification {
+  id               String   @id @default(cuid())
+  userId           String
+  type             String // task_assigned | task_status_changed | task_comment
+  title            String
+  body             String?
+  relatedTaskId    String?
+  relatedProjectId String?
+  isRead           Boolean  @default(false)
+  createdAt        DateTime @default(now())
+
+  user           User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  relatedTask    Task?   @relation("notifTasks", fields: [relatedTaskId], references: [id], onDelete: SetNull)
+
+  @@index([userId])
+  @@map("notifications")
+}
