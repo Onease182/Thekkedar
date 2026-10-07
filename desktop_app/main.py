@@ -247,8 +247,7 @@ class MainWindow(QMainWindow):
             writer = csv.writer(f); writer.writerow(["Title","Priority","Status","Assignee","Trade","Location","Due date","Plan","Tags"])
             for t in rows: writer.writerow([t["title"],t["priority"],t["status"],t["assignee"],t["trade"],t["location"],t["due_date"],t["plan_title"] or "",t["tags"]])
         self.db.add_notification("Tasks exported", f"Exported {len(rows)} task(s) to {Path(path).name}.")
-        QMessageBox.information(self, "Export complete", f"Saved {len(rows)} tasks to:
-{path}")
+        QMessageBox.information(self, "Export complete", f"Saved {len(rows)} tasks to:\n{path}")
 
     def delete_selected_task(self, table):
         row = table.currentRow()
